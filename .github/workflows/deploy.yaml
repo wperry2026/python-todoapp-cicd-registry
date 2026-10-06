@@ -1,0 +1,169 @@
+name: Build and Push Docker Image to Amazon ECR (OIDC)
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches: 
+      - main
+      - dev
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write # Required to post/update PR comments
+  security-events: write # Required to upload SARIF results to Security tab
+
+env:
+  AWS_REGION: ap-southeast-4 # Change to your AWS region
+  ECR_REPOSITORY: todoapp # Change to your ECR repository name
+  ROLE_ARN: arn:aws:iam::096966628706:role/github-actions-ecr-cicd-role # Replace with your IAM Role ARN
+
+jobs:
+  build-and-push:
+    name: Build, Scan and Push to ECR
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+  # -------------------------------------------------------------
+  # STEP 1: LINT DOCKERFILE (Fast static check)
+  # -------------------------------------------------------------
+      - name: Run Hadolint (Dockerfile Linter)
+        id: hadolint
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: Dockerfile
+          failure-threshold: error
+          ignore-fails: true # Allows workflow to continue so comment step can run
+
+      - name: Comment PR with Hadolint Results
+        uses: peter-evans/create-or-update-comment@v4
+        if: github.event_name == 'pull_request' && always()
+        with:
+          issue-number: ${{ github.event.pull_request.number }}
+          body: |
+            ### 🐳 Hadolint Dockerfile Linting Results
+            ```text
+            ${{ steps.read_hadolint.outputs.HADOLINT_REPORT }}
+            ```    
+  #-------------------------------------------------------------
+  # STEP 2: OIDC Authentication step using role-to-assume
+  #-------------------------------------------------------------
+      - name: Configure AWS Credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: GitHubActionsECRPush
+
+      - name: Log in to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+  #-------------------------------------------------------------
+  # STEP 3: Build and Tag Docker Image
+  #-------------------------------------------------------------
+      - name: Build and Tag Docker Image
+        run: |
+          docker build \
+            -t ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }} \
+            -t ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest .
+
+  # -------------------------------------------------------------------
+  # STEP 4: TRIVY SECURITY GATE & REPORTING
+  # -------------------------------------------------------------------
+
+      # 4a. Run Trivy to generate human-readable Table Report for PR Comment
+      - name: Run Trivy Vulnerability Scanner (Table Report)
+        id: trivy_table
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: '${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}'
+          format: 'table'
+          output: 'trivy-report.txt'
+          exit-code: '0' # Keep 0 here so subsequent report/upload steps run smoothly
+          ignore-unfixed: true
+          vuln-type: 'os,library'
+          severity: 'HIGH,CRITICAL'
+
+      # 4b. Run Trivy to generate SARIF output for GitHub Code Scanning
+      - name: Run Trivy Vulnerability Scanner (SARIF Report)
+        id: trivy_sarif
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: '${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          exit-code: '0'
+          ignore-unfixed: true
+          vuln-type: 'os,library'
+          severity: 'HIGH,CRITICAL'
+
+      # 4c. Read table report output into a GitHub Step Output variable
+      - name: Read Trivy Report
+        id: read_trivy
+        if: always()
+        run: |
+          TRIVY_CONTENT=$(cat trivy-report.txt)
+          echo "REPORT<<EOF" >> $GITHUB_OUTPUT
+          echo "$TRIVY_CONTENT" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      # 4d. Comment results directly on the Pull Request
+      - name: Comment PR with Trivy Results
+        uses: peter-evans/create-or-update-comment@v4
+        if: github.event_name == 'pull_request' && always()
+        with:
+          issue-number: ${{ github.event.pull_request.number }}
+          body: |
+            ### 🛡️ Trivy Container Vulnerability Scan
+            ```text
+            ${{ steps.read_trivy.outputs.REPORT }}
+            ```
+
+      # 4e. Upload SARIF report to GitHub Security (Files Changed & Security tab)
+      - name: Upload Trivy SARIF report to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+      # 4f. Enforce Security Gate Failure (Fails build if vulnerabilities exist)
+      - name: Evaluate Trivy Scan Gate
+        run: |
+          if grep -q -E "HIGH|CRITICAL" trivy-report.txt; then
+            echo "❌ High or Critical vulnerabilities found in Trivy scan."
+            exit 1
+          fi
+
+  #-------------------------------------------------------------
+  # STEP 5: Evaluate Security & Linting Gates
+  #-------------------------------------------------------------
+      - name: Evaluate Security & Linting Gate
+        run: |
+        
+          if [ "${{ steps.hadolint.outcome }}" == "failure" ]; then
+            echo "❌ Hadolint found errors in the Dockerfile."
+            HADOLINT_FAILED=true
+          fi
+
+          if grep -q -E "HIGH|CRITICAL" trivy-report.txt; then
+            echo "❌ High or Critical vulnerabilities found in Trivy scan."
+            TRIVY_FAILED=true
+          fi
+
+          if [ "$HADOLINT_FAILED" = true ] || [ "$TRIVY_FAILED" = true ]; then
+            exit 1
+          fi
+
+  #-----------------------------------------------------------------------------
+  # STEP 6: Runs on push to main branch only, and pushes the Docker image to ECR
+  #-----------------------------------------------------------------------------
+      - name: Push Docker Image to ECR
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          docker push ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+          docker push ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest
