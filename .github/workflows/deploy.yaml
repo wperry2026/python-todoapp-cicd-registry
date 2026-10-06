@@ -40,7 +40,7 @@ jobs:
           ignore-fails: true # Allows workflow to continue so comment step can run
 
       - name: Comment PR with Hadolint Results
-        uses: peter-evans/create-or-comment-on-pr@v3
+        uses: peter-evans/create-or-update-comment@v4
         if: github.event_name == 'pull_request' && always()
         with:
           issue-number: ${{ github.event.pull_request.number }}
@@ -114,7 +114,7 @@ jobs:
 
       # 4d. Comment results directly on the Pull Request
       - name: Comment PR with Trivy Results
-        uses: peter-evans/create-or-comment-on-pr@v3
+        uses: peter-evans/create-or-update-comment@v4
         if: github.event_name == 'pull_request' && always()
         with:
           issue-number: ${{ github.event.pull_request.number }}
